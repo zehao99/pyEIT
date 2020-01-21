@@ -3,7 +3,7 @@ Reconstruction algorithms for EIT.
 
 Arithmetic
 ----------
-- fem : Finite-element method
+- efem : Finite-element method
 - base : EitBase class
 - bp : Back-projection
 - jac : Jacobian matrix based method

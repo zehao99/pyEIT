@@ -1,6 +1,9 @@
 from __future__ import division, absolute_import, print_function
 
 import numpy as np 
+import matplotlib.pyplot as plt
+
+import pyeit.mesh as mesh
 from scipy import sparse
 import math
 
@@ -20,37 +23,53 @@ class Forward(object):
             electrode mesh element numbers 
         """
         self.nodes = mesh['node']
-        self.node_num = self.nodes.shape(0)
+        self.node_num = np.shape(self.nodes)[0]
         self.node_num_bound = 0
         self.node_num_f = 0
-        self.elem = mesh['element']
+        self.elem =  mesh['element']
+        self.elem_num = np.shape(self.elem)[0]
         self.elem_perm = mesh['perm']
-        self.elem_capacity = np.zeros(self.elem_perm.shape())
+        self.elem_capacity = np.zeros(np.shape(self.elem_perm))
         self.electrode_mesh = electrode_meshes
-        self.electrode_nums = self.electrode_mesh.shape(0)
-        self.elem_param = np.zeros((self.elem.shape(0),7)) # area, b1, b2, b3, c1, c2, c3
+        self.electrode_nums = np.shape(self.electrode_mesh)[0]
+        self.elem_param = np.zeros((np.shape(self.elem)[0],7)) # area, b1, b2, b3, c1, c2, c3
         self.freq = freqency
         self.K_sparse = np.zeros((self.node_num,self.node_num),dtype = np.complex128)
         self.K_node_num_list = [x for x in range(self.node_num)]# Node number mapping list when calculating
         self.node_potential = np.zeros((self.node_num), dtype = np.complex128)
+        self.element_potential = np.zeros((self.elem_num),dtype = np.complex128)
         
     def calculation(self):
         self.calculate_param()
         self.construct_sparse_matrix()
         self.set_boundary_condition()
-        self.calculate_FEM()
-
+        #split time into a  
+        for i in range(1000):
+            theta = 2*math.pi/1000 * i
+            self.node_potential += np.abs(self.calculate_FEM(theta))
+        self.node_potential /= 1000
+        self.calculate_element_potential()
+        return self.node_potential, self.element_potential
+    
+    def JACcalculation(self):
+        """
+        calculate Jaccobian matrix for Amplitude and phase
+        """
 
     def calculate_param(self):
         """
         Update parameters for stiffness matrix
         """
-        x = y = a = b = c = [.0,.0,.0]
+        x = [.0,.0,.0]
+        a = [.0,.0,.0]
+        b = [.0,.0,.0]
+        c = [.0,.0,.0]
+        y = [.0,.0,.0]
         count = 0
         for element in self.elem:
-            x[0], y[0] = self.nodes[element[0]]
-            x[1], y[1] = self.nodes[element[1]]
-            x[2], y[2] = self.nodes[element[2]]
+            for i in range(3):
+                x[i] = self.nodes[element[i],0]
+                y[i] = self.nodes[element[i],1]
             for i in range(3):
                 a[i] = x[(1+i)%3] * y[(2+i)%3] - x[(2+i)%3] * y[(1+i)%3]
                 b[i] = y[(1+i)%3] - y[(2+i)%3]
@@ -65,17 +84,24 @@ class Forward(object):
         """
         index = 0
         K_ij = 0 + 0j
-        patern = [[0,0],[1,1],[2,2],[0,1],[1,2],[2,0]]
+        patern = [[0,0],[1,1],[2,2],[0,1],[1,2],[2,0],[1,0],[2,1],[0,2]]
         for element in self.elem:
             param = self.elem_param[index]
             for i,j in patern:
-                if self.K_sparse[element[i]][element[j]] == 0:
-                    if i != j :
-                        # stiffness k_ij = sigma/4 * (bk1*bk2 + ck1*ck2) - j * w * capacity * (bk1 * ck2 - bk2 * ck1) /24
-                        K_ij = self.elem_perm[index] * (param[1+i] * param[1+j] + param[4+i] * param[4+j]) / 4 - (self.freq * self.elem_capacity * param[0] /12) * 1j 
-                    else:
-                        K_ij = self.elem_perm[index] * (param[1+i] * param[1+j] + param[4+i] * param[4+j]) / 4 - (self.freq * self.elem_capacity * param[0] /6) * 1j  
-                    self.K_sparse[element[i]][element[j]] = self.K_sparse[element[j]][element[i]] = K_ij
+                if i != j :
+                     # stiffness k_ij = sigma/4 * (bk1*bk2 + ck1*ck2) - j * w * capacity * (bk1 * ck2 - bk2 * ck1) /24
+                    K_ij = self.elem_perm[index] * (param[1+i] * param[1+j] + param[4+i] * param[4+j]) / (4 * param[0]) -  (self.freq * self.elem_capacity[index] * param[0] /12) * 1j
+                else:
+                    K_ij = self.elem_perm[index] * (param[1+i] * param[1+j] + param[4+i] * param[4+j]) / (4 * param[0]) - (self.freq * self.elem_capacity[index] * param[0] /6) * 1j
+                self.K_sparse[element[i]][element[j]] += K_ij
+                self.K_sparse[element[j]][element[i]] += K_ij
+                
+                if self.elem_capacity[index] != 0:
+                    print(self.elem_capacity[index])
+                    print((self.freq * self.elem_capacity[index] * param[0] /6) * 1j)
+                if np.imag( K_ij ) != 0:
+                    print(K_ij)
+                
             index += 1
 
     def set_boundary_condition(self):
@@ -92,23 +118,37 @@ class Forward(object):
             index = index - 1
             self.swap(list_num, index)
 
-    def change_capacity(self, element_dict):
-        
+    def change_capacity(self, element_list, capacity_list):
+        if len(element_list) == len(capacity_list):
+            for i, ele_num in enumerate(element_list):
+                self.elem_capacity[ele_num] = capacity_list[i]
+        else:
+            print('The length of element doesn\'t match the length of capacity')
+    
+    def change_conductivity(self, element_list, resistance_list):
+        if len(element_list) == len(resistance_list):
+            for i, ele_num in enumerate(element_list):
+                self.elem_perm[ele_num] = resistance_list[i]
+        else:
+            print('The length of element doesn\'t match the length of capacity')
 
 
-    def calculate_FEM(self):
+    def calculate_FEM(self, theta):
         theta = math.pi / 4 # changing theta could help increasing the accuracy
-        potential_f = np.zeros((1,self.node_num_f),dtype=np.complex128) # set the phi_f and phi_b
-        potential_b = (math.cos(theta) + 1j * math.sin(theta)) * np.ones((1,self.node_num_bound))
-        K_f = self.K_sparse[[0:self.node_num_f - 1], [0:self.node_num_f - 1]]
-        K_b = self.K_sparse[[0 : self.node_num_f], [self.node_num_f : self.node_num - 1]]
+        potential_f = np.zeros((self.node_num_f,1),dtype=np.complex128) # set the phi_f and phi_b
+        potential_b = (math.cos(theta) + 1j * math.sin(theta)) * np.ones((self.node_num_bound,1))
+        K_f = self.K_sparse[0 : self.node_num_f, 0 : self.node_num_f]
+        K_b = self.K_sparse[0 : self.node_num_f, self.node_num_f : self.node_num]
         potential_f = -np.dot(np.dot(np.linalg.inv(K_f),K_b),potential_b)
         potential_f = np.reshape(potential_f,(-1))
         potential_b = np.reshape(potential_b,(-1))
-        np.append(potential_f,potential_b)
-        self.node_potential = potential_f[self.K_node_num_list] #change back to mesh node No.
+        potential_f = np.append(potential_f,potential_b)
+        return potential_f
 
-
+    def calculate_element_potential(self):
+        for i, element_param in enumerate(self.elem_param):
+            k1 , k2 , k3 = self.elem[i]
+            self.element_potential[i] = (self.node_potential[k1]+self.node_potential[k2]+self.node_potential[k3])/3
 
 
         
@@ -118,6 +158,30 @@ class Forward(object):
         """
         self.K_sparse[[a,b], :] = self.K_sparse[[b,a], :]
         self.K_sparse[:, [a,b]] = self.K_sparse[:, [b,a]]
-        self.K_node_num_list[a,b] = self.K_node_num_list[b,a]
+        self.K_node_num_list[a],self.K_node_num_list[b] = self.K_node_num_list[b], self.K_node_num_list[a]
 
     
+""" 0. construct mesh """
+mesh_obj, el_pos = mesh.create(16, h0=0.1)
+# extract node, element, alpha
+points = mesh_obj['node']
+tri = mesh_obj['element']
+x, y = points[:, 0], points[:, 1]
+
+""" 1. problem setup """
+fwd = Forward(mesh_obj,[tri[0],tri[1]])
+fwd.elem_perm = 10 * fwd.elem_perm
+#fwd.change_capacity([100,101,102,103,104,105],[100,100,100,100,100,100])
+_ , elem_u = fwd.calculation()
+
+fig, ax = plt.subplots(figsize=(6, 4))
+im = ax.tripcolor(x, y, tri, np.abs(elem_u), shading='flat')
+fig.colorbar(im)
+ax.set_aspect('equal')
+
+fig, ax = plt.subplots(figsize=(6, 4))
+im = ax.tripcolor(x, y, tri, np.real(fwd.elem_capacity), shading='flat')
+fig.colorbar(im)
+ax.set_aspect('equal')
+
+plt.show()
