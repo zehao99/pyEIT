@@ -16,7 +16,7 @@ x, y = points[:, 0], points[:, 1]
 """ 1. problem setup """
 fwd = Forward(mesh_obj,[tri[0],tri[1]])
 fwd.elem_perm = 10 * fwd.elem_perm
-#fwd.change_capacity([100,101,102,103,104,105],[100,100,100,100,100,100])
+fwd.change_capacity([100,101,102,103,104,105],[0.000001,0.000001,0.000001,0.000001,0.000001,0.000001])
 _ , elem_u = fwd.calculation()
 
 fig, ax = plt.subplots(figsize=(6, 4))
