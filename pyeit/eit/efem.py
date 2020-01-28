@@ -4,58 +4,61 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 import pyeit.mesh as mesh
-from scipy import sparse
 import math
 
 
 
-class Forward(object):
+class EFEM(object):
     """
     FEM solving for capacity included forward problem
-    Parameters:
-    mesh: dict with "node", "element" "perm" "capacity"
-        "node": N_node * 2 NDArray 
-                contains coordinate information of each node
-        "element": N_elem * 3 NDArray
-                contains the node number contained in each element
-        "perm": N_elem NDArray
-                contains permitivity on each element
-        "capacity": N_elem NDArray
-                contains capacity density on each element
     
-    electrode_meshes: electrode_numbers NdArray
-    
-    frequency : float Input frequency
 
     """
 
-    def __init__(self, mesh, electrode_meshes = np.array([[0]]), freqency = 20000.0):
-        """parameters
-        mesh: dict
-             mesh structure
-             2D Mesh triangle elements 
-        electrode_meshes: 2D array 
-            electrode mesh element numbers 
+    def __init__(self, mesh, electrode_nums, freqency = 20000.0):
         """
+        Parameters:
+        mesh: dict with "node", "element" "perm" "capacity"
+            "node": N_node * 2 NDArray 
+                    contains coordinate information of each node
+            "element": N_elem * 3 NDArray
+                    contains the node number contained in each element
+            "perm": N_elem NDArray
+                    contains permitivity on each element
+            "capacity": N_elem NDArray
+                    contains capacity density on each element
+    
+        electrode_nums:  int electrode numbers
+    
+        frequency : float Input frequency
+        """
+        #check data structure
         self.nodes = mesh['node']
         self.node_num = np.shape(self.nodes)[0]
+        if np.shape(self.nodes)[1] != 2:
+            raise Exception("Node coordinates incorrect")
         self.node_num_bound = 0
         self.node_num_f = 0
         self.elem =  mesh['element']
+        if np.shape(self.elem)[1] != 3:
+            raise Exception("Elements incorrect")
         self.elem_num = np.shape(self.elem)[0]
         self.elem_perm = mesh['perm']
         self.elem_capacity = np.zeros(np.shape(self.elem_perm))
-        self.electrode_mesh = electrode_meshes
-        self.electrode_nums = np.shape(self.electrode_mesh)[0]
-        self.elem_param = np.zeros((np.shape(self.elem)[0],7)) # area, b1, b2, b3, c1, c2, c3
+        self.elem_param = np.zeros((np.shape(self.elem)[0],9)) # area, b1, b2, b3, c1, c2, c3, x_average, y_average
+        self.electrode_num = electrode_nums
+        self.electrode_mesh = dict()
+        for i in range(electrode_nums):
+            self.electrode_mesh[str(i)] = list()
         self.freq = freqency
         self.K_sparse = np.zeros((self.node_num,self.node_num),dtype = np.complex128)
         self.K_node_num_list = [x for x in range(self.node_num)]# Node number mapping list when calculating
         self.node_potential = np.zeros((self.node_num), dtype = np.complex128)
         self.element_potential = np.zeros((self.elem_num),dtype = np.complex128)
+        self.electrode_potential = np.zeros((self.electrode_num), dtype = np.complex128)
+        self.initialize()
         
     def calculation(self):
-        self.calculate_param()
         self.construct_sparse_matrix()
         self.set_boundary_condition()
         #split time into a  
@@ -63,21 +66,22 @@ class Forward(object):
             theta = 2*math.pi/100 * i
             self.node_potential += np.abs(self.calculate_FEM(theta))
         self.node_potential /= 100
+        self.sync_back_potential()
         self.calculate_element_potential()
+        self.calc_electrode_potential()
         return self.node_potential, self.element_potential
-    
-    def JACcalculation(self):
-        """
-        calculate Jaccobian matrix for Amplitude and phase
-        """
 
-    def calculate_param(self):
+    def initialize(self):
         """
         Update parameters for each element
-        
+        Parameters used for calculating sparse matrix
+        a1 = x2 * y3 - x3 * y2
+        b1 = y2 - y3
+        c1 = x3 - x2
+        area = (b1 * c2 - b2 * c1) / 2
         """
         x = [.0,.0,.0]
-        a = [.0,.0,.0]
+        #a = [.0,.0,.0]
         b = [.0,.0,.0]
         c = [.0,.0,.0]
         y = [.0,.0,.0]
@@ -91,7 +95,9 @@ class Forward(object):
                 b[i] = y[(1+i)%3] - y[(2+i)%3]
                 c[i] = x[(2+i)%3] - x[(1+i)%3]
             area = (b[0] * c[1] - b[1] * c[0])/2
-            self.elem_param[count] = [area, b[0], b[1], b[2], c[0], c[1], c[2]]
+            x_average = np.mean(x)
+            y_average = np.mean(y)
+            self.elem_param[count] = [area, b[0], b[1], b[2], c[0], c[1], c[2], x_average, y_average]
             count += 1
     
     def construct_sparse_matrix(self):
@@ -124,11 +130,18 @@ class Forward(object):
     def set_boundary_condition(self):
         """
         Update boundary condition according to electrode mesh
+
         The boundary is at the input electrode whose potential is all Ae ^ iPhi
 
         And swap the index of matrix put the boundary elements at the bottom of the sparse matrix
         """
-        node_list = np.reshape(self.electrode_mesh, (-1)) # reshape to 1D
+        node_list = [] # reshape all nodes to 1D
+        for electrodes in self.electrode_mesh.values():
+            for element in electrodes:
+                node_list.append(self.elem[element][0])
+                node_list.append(self.elem[element][1])
+                node_list.append(self.elem[element][2])
+        node_list = np.array(node_list)
         node_list = list(np.unique(node_list)) # get rid of repeat numbers 
         index = self.node_num
         self.node_num_bound = len(node_list)
@@ -137,21 +150,56 @@ class Forward(object):
             index = index - 1
             self.swap(list_num, index)
 
-    def change_capacity(self, element_list, capacity_list):
+    def change_capacity_elementwise(self, element_list, capacity_list):
         """
+        Change capacity in certain area according to ELEMENT NUMBER
         """
         if len(element_list) == len(capacity_list):
             for i, ele_num in enumerate(element_list):
+                if ele_num > self.elem_num:
+                    raise Exception("Element number exceeds limit")
                 self.elem_capacity[ele_num] = capacity_list[i]
         else:
-            print('The length of element doesn\'t match the length of capacity')
-    
+            raise Exception('The length of element doesn\'t match the length of capacity')
+
+    def change_capacity_geometry(self, center, radius, value, shape):
+        """
+        Parameters: shape: "circle", "square"
+
+        Change capacity in certain area according to GEOMETRY
+        """
+        if shape == "square":
+            candidate = list()
+            center_x, center_y = center
+            count = 0
+            for i, x in enumerate(self.elem_param[:, 7]):
+                if x <= (center_x + radius) and x >= (center_x - radius) and self.elem_param[i][8] <= (center_y + radius) and self.elem_param[i][8] >= (center_y - radius):
+                    self.elem_capacity[i] = value
+                    count += 1                    
+            if count == 0:
+                raise Exception("No element is selected, please check the input")
+        elif shape == "circle":
+            count = 0
+            for i, x in enumerate(self.elem_param[:, 7]):
+                if np.sqrt((center_x - x)**2+(center_y - self.elem_param[i][:, 8])**2) <= radius:
+                    self.elem_capacity[i] = value
+                    count += 1 
+        else:
+            raise Exception("No such shape, please check the input")
+
     def change_conductivity(self, element_list, resistance_list):
+        """
+
+        Change conductivity in certain area according to ELEMENT NUMBER
+        
+        """
         if len(element_list) == len(resistance_list):
             for i, ele_num in enumerate(element_list):
+                if ele_num > self.elem_num:
+                    raise Exception("Element number exceeds limit")
                 self.elem_perm[ele_num] = resistance_list[i]
         else:
-            print('The length of element doesn\'t match the length of capacity')
+            raise Exception('The length of element doesn\'t match the length of capacity')
 
 
     def calculate_FEM(self, theta):
@@ -166,13 +214,50 @@ class Forward(object):
         potential_f = np.append(potential_f , potential_b)
         return potential_f
 
+    def sync_back_potential(self):
+        """
+        Put the potential back in order
+        """
+        potential = np.copy(self.node_potential)
+        for i, j in enumerate(self.K_node_num_list):
+            self.node_potential[j] = potential[i] 
+
     def calculate_element_potential(self):
-        for i, element_param in enumerate(self.elem_param):
+        """
+        Get of each element potential
+        Average of each nodes
+        """
+        for i, _ in enumerate(self.elem_param):
             k1 , k2 , k3 = self.elem[i]
             self.element_potential[i] = (self.node_potential[k1]+self.node_potential[k2]+self.node_potential[k3])/3
 
-
-        
+    def calc_electrode_elements(self, electrode_number, center, radius):
+        """
+        Get the electrode element sets for every electrode 
+        According to the square area given and put values into electrode_mesh dict
+        """
+        if electrode_number >= self.electrode_num:
+            raise Exception("the input number exceeded electrode numbers")
+        else:
+            center_x, center_y = center
+            count = 0
+            for i, x in enumerate(self.elem_param[:,7]):
+                if x <= (center_x + radius) and x >= (center_x - radius) and self.elem_param[i][8] <= (center_y + radius) and self.elem_param[i][8] >= (center_y - radius):
+                    self.electrode_mesh[str(electrode_number)].append(i)
+                    count += 1
+            if count == 0:
+                raise Exception("No element is selected, please check the input")
+    
+    def calc_electrode_potential(self):
+        """
+        Get the mean value of potential on every electrode
+        """
+        for i, elements in enumerate(self.electrode_mesh.values()):
+            potential = []
+            for element in elements:
+                potential.append(self.element_potential[element])
+            self.electrode_potential[i] = np.mean(np.array(potential))
+    
     def swap(self, a, b):
         """
         Swap two rows and columns of the sparse matrix
@@ -182,3 +267,29 @@ class Forward(object):
         self.K_node_num_list[a],self.K_node_num_list[b] = self.K_node_num_list[b], self.K_node_num_list[a]
 
     
+
+""" 0. construct mesh """
+mesh_obj, el_pos = mesh.create(16, h0=0.1)
+# extract node, element, alpha
+points = mesh_obj['node']
+tri = mesh_obj['element']
+x, y = points[:, 0], points[:, 1]
+
+""" 1. problem setup """
+fwd = EFEM(mesh_obj,1)
+fwd.elem_perm = 10 * fwd.elem_perm
+fwd.calc_electrode_elements(0,[0,-1],0.2)
+fwd.change_capacity_elementwise([100,101,102,103,104,105],[0.000001,0.000001,0.000001,0.000001,0.000001,0.000001])
+_ , elem_u = fwd.calculation()
+
+fig, ax = plt.subplots(figsize=(6, 4))
+im = ax.tripcolor(x, y, tri, np.abs(elem_u), shading='flat')
+fig.colorbar(im)
+ax.set_aspect('equal')
+
+fig, ax = plt.subplots(figsize=(6, 4))
+im = ax.tripcolor(x, y, tri, np.real(fwd.elem_capacity), shading='flat')
+fig.colorbar(im)
+ax.set_aspect('equal')
+
+plt.show()
