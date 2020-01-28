@@ -14,9 +14,10 @@ tri = mesh_obj['element']
 x, y = points[:, 0], points[:, 1]
 
 """ 1. problem setup """
-fwd = EFEM(mesh_obj,[tri[0],tri[1]])
+fwd = EFEM(mesh_obj,1)
 fwd.elem_perm = 10 * fwd.elem_perm
-fwd.change_capacity([100,101,102,103,104,105],[0.0001,0.000001,0.000001,0.000001,0.000001,0.000001])
+fwd.calc_electrode_elements(0,[0,-1],0.2)
+fwd.change_capacity_elementwise([100,101,102,103,104,105],[0.000001,0.000001,0.000001,0.000001,0.000001,0.000001])
 _ , elem_u = fwd.calculation()
 
 fig, ax = plt.subplots(figsize=(6, 4))
