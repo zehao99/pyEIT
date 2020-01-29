@@ -1,18 +1,19 @@
 from __future__ import division, absolute_import, print_function
+from numba import jit
+
 
 import numpy as np 
-import matplotlib.pyplot as plt
-
-import pyeit.mesh as mesh
+import cupy as cp
+import time
 import math
 
+import matplotlib.pyplot as plt
+import pyeit.mesh as mesh
 
 
 class EFEM(object):
     """
     FEM solving for capacity included forward problem
-    
-
     """
 
     def __init__(self, mesh, electrode_nums, freqency = 20000.0):
@@ -49,7 +50,7 @@ class EFEM(object):
         self.electrode_num = electrode_nums
         self.electrode_mesh = dict()
         for i in range(electrode_nums):
-            self.electrode_mesh[str(i)] = list()
+            self.electrode_mesh[i] = list()
         self.freq = freqency
         self.K_sparse = np.zeros((self.node_num,self.node_num),dtype = np.complex128)
         self.K_node_num_list = [x for x in range(self.node_num)]# Node number mapping list when calculating
@@ -58,18 +59,24 @@ class EFEM(object):
         self.electrode_potential = np.zeros((self.electrode_num), dtype = np.complex128)
         self.initialize()
         
-    def calculation(self):
+    def calculation(self,electrode_input):
+        """
+        Parameters: electrode_input input position
+        """
         self.construct_sparse_matrix()
-        self.set_boundary_condition()
-        #split time into a  
-        for i in range(100):
-            theta = 2*math.pi/100 * i
-            self.node_potential += np.abs(self.calculate_FEM(theta))
-        self.node_potential /= 100
+        self.set_boundary_condition(electrode_input)
+        #split time into frames
+        frames = 8
+        temp_node_potential = np.zeros((self.node_num), dtype = np.complex128)        
+        for i in range(frames):
+            theta = np.float(2*np.pi/frames * i)
+            temp_node_potential += np.abs(self.calculate_FEM(theta))
+        temp_node_potential /= frames
+        self.node_potential = temp_node_potential
         self.sync_back_potential()
         self.calculate_element_potential()
         self.calc_electrode_potential()
-        return self.node_potential, self.element_potential
+        return self.node_potential, self.element_potential, self.electrode_potential
 
     def initialize(self):
         """
@@ -127,7 +134,7 @@ class EFEM(object):
                 """
             index += 1
 
-    def set_boundary_condition(self):
+    def set_boundary_condition(self, electrode_input):
         """
         Update boundary condition according to electrode mesh
 
@@ -136,11 +143,11 @@ class EFEM(object):
         And swap the index of matrix put the boundary elements at the bottom of the sparse matrix
         """
         node_list = [] # reshape all nodes to 1D
-        for electrodes in self.electrode_mesh.values():
-            for element in electrodes:
-                node_list.append(self.elem[element][0])
-                node_list.append(self.elem[element][1])
-                node_list.append(self.elem[element][2])
+        electrode_list = list(self.electrode_mesh.values())
+        for element in electrode_list[electrode_input]:
+            node_list.append(self.elem[element][0])
+            node_list.append(self.elem[element][1])
+            node_list.append(self.elem[element][2])
         node_list = np.array(node_list)
         node_list = list(np.unique(node_list)) # get rid of repeat numbers 
         index = self.node_num
@@ -169,7 +176,6 @@ class EFEM(object):
         Change capacity in certain area according to GEOMETRY
         """
         if shape == "square":
-            candidate = list()
             center_x, center_y = center
             count = 0
             for i, x in enumerate(self.elem_param[:, 7]):
@@ -179,9 +185,10 @@ class EFEM(object):
             if count == 0:
                 raise Exception("No element is selected, please check the input")
         elif shape == "circle":
+            center_x, center_y = center
             count = 0
             for i, x in enumerate(self.elem_param[:, 7]):
-                if np.sqrt((center_x - x)**2+(center_y - self.elem_param[i][:, 8])**2) <= radius:
+                if np.sqrt((center_x - x)**2+(center_y - self.elem_param[i][8])**2) <= radius:
                     self.elem_capacity[i] = value
                     count += 1 
         else:
@@ -191,7 +198,7 @@ class EFEM(object):
         """
 
         Change conductivity in certain area according to ELEMENT NUMBER
-        
+
         """
         if len(element_list) == len(resistance_list):
             for i, ele_num in enumerate(element_list):
@@ -200,15 +207,25 @@ class EFEM(object):
                 self.elem_perm[ele_num] = resistance_list[i]
         else:
             raise Exception('The length of element doesn\'t match the length of capacity')
-
-
+    
     def calculate_FEM(self, theta):
-        theta = math.pi / 4 # changing theta could help increasing the accuracy
+        # changing theta could help increasing the accuracy
         potential_f = np.zeros((self.node_num_f , 1) , dtype=np.complex128) # set the phi_f and phi_b
-        potential_b = (math.cos(theta) + 1j * math.sin(theta)) * np.ones((self.node_num_bound , 1))
+        potential_b = (np.cos(theta) + 1j * math.sin(theta)) * np.ones((self.node_num_bound , 1))
         K_f = self.K_sparse[0 : self.node_num_f, 0 : self.node_num_f]
         K_b = self.K_sparse[0 : self.node_num_f, self.node_num_f : self.node_num]
-        potential_f = - np.dot(np.dot(np.linalg.inv(K_f) , K_b) , potential_b) #solving the linear equation set
+        #since = time.time()
+        potential_f = calculate_FEM_equation(potential_f, K_f, K_b, potential_b)
+        #potential_f = - np.dot(np.dot(np.linalg.inv(K_f) , K_b) , potential_b) #solving the linear equation set
+        #print(time.time()-since)
+        """
+        K_f_gpu = cp.asarray(K_f)
+        K_b_gpu = cp.asarray(K_b)
+        potential_b_gpu = cp.asarray(potential_b)
+        potential_f_gpu = - cp.dot(cp.dot(cp.linalg.inv(K_f_gpu) , K_b_gpu) , potential_b_gpu) #solving the linear equation set
+        potential_f = cp.asnumpy(potential_f_gpu)
+        potential_b = cp.asnumpy(potential_b_gpu)
+        """
         potential_f = np.reshape(potential_f , (-1))
         potential_b = np.reshape(potential_b , (-1))
         potential_f = np.append(potential_f , potential_b)
@@ -243,7 +260,7 @@ class EFEM(object):
             count = 0
             for i, x in enumerate(self.elem_param[:,7]):
                 if x <= (center_x + radius) and x >= (center_x - radius) and self.elem_param[i][8] <= (center_y + radius) and self.elem_param[i][8] >= (center_y - radius):
-                    self.electrode_mesh[str(electrode_number)].append(i)
+                    self.electrode_mesh[electrode_number].append(i)
                     count += 1
             if count == 0:
                 raise Exception("No element is selected, please check the input")
@@ -266,30 +283,8 @@ class EFEM(object):
         self.K_sparse[:, [a,b]] = self.K_sparse[:, [b,a]]
         self.K_node_num_list[a],self.K_node_num_list[b] = self.K_node_num_list[b], self.K_node_num_list[a]
 
-    
+@jit
+def calculate_FEM_equation(potential_f, K_f, K_b, potential_b):
+    return - np.dot(np.dot(np.linalg.inv(K_f) , K_b) , potential_b) #solving the linear equation set
 
-""" 0. construct mesh """
-mesh_obj, el_pos = mesh.create(16, h0=0.1)
-# extract node, element, alpha
-points = mesh_obj['node']
-tri = mesh_obj['element']
-x, y = points[:, 0], points[:, 1]
 
-""" 1. problem setup """
-fwd = EFEM(mesh_obj,1)
-fwd.elem_perm = 10 * fwd.elem_perm
-fwd.calc_electrode_elements(0,[0,-1],0.2)
-fwd.change_capacity_elementwise([100,101,102,103,104,105],[0.000001,0.000001,0.000001,0.000001,0.000001,0.000001])
-_ , elem_u = fwd.calculation()
-
-fig, ax = plt.subplots(figsize=(6, 4))
-im = ax.tripcolor(x, y, tri, np.abs(elem_u), shading='flat')
-fig.colorbar(im)
-ax.set_aspect('equal')
-
-fig, ax = plt.subplots(figsize=(6, 4))
-im = ax.tripcolor(x, y, tri, np.real(fwd.elem_capacity), shading='flat')
-fig.colorbar(im)
-ax.set_aspect('equal')
-
-plt.show()
